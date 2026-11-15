@@ -1,0 +1,354 @@
+# Protocol-only workflow: jobs check out the unchanged mathematical contribution.
+name: Fixed-commit validation phase
+
+'on':
+  workflow_call:
+    inputs:
+      phase:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    if: github.repository == 'solidity-master/proximityprize'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    env:
+      PHASE: ${{ inputs.phase }}
+      SOURCE_COMMIT: fe58c7877f135aafd0abb76c89a0d5865a01d798
+      SOURCE_BASE: a15abf509f39bf87781119462b81d9c5e08a6848
+      PROTOCOL_COMMIT: ${{ github.sha }}
+      SOURCE_FILE: ArkLib/Research/ProximityGap/Frontier/FoldedSourceFiber.lean
+      SOURCE_SHA256: f94da8f0f3f06885752c103ebd379b016c3b0108450ead74e4b07790573296cb
+      LEAN_NUM_THREADS: '1'
+      CXX: g++
+      ELAN_HOME: ${{ runner.temp }}/delta-star-elan
+      EVIDENCE_DIR: ${{ runner.temp }}/delta-star-evidence
+      BUNDLE_DIR: ${{ runner.temp }}/delta-star-prebuild
+
+    steps:
+      - name: Check out the fixed contribution
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: solidity-master/proximityprize
+          ref: fe58c7877f135aafd0abb76c89a0d5865a01d798
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+
+      - name: Verify proof and protocol identities
+        run: |
+          set -euo pipefail
+          case "$PHASE" in prebuild|validate|axioms) ;; *) exit 1 ;; esac
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_BASE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" "$PROTOCOL_COMMIT"
+          test "$(cat lean-toolchain)" = leanprover/lean4:v4.35.0
+          printf '%s  %s\n' "$SOURCE_SHA256" "$SOURCE_FILE" | sha256sum --check
+          mkdir -p "$EVIDENCE_DIR" "$BUNDLE_DIR"
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          expected = {
+              '.github/workflows/check-imports.yml',
+              '.github/workflows/folded-source-fiber-validation-phase.yml',
+          }
+          changed = set(subprocess.check_output([
+              'git', 'diff', '--name-only', os.environ['SOURCE_COMMIT'],
+              os.environ['PROTOCOL_COMMIT']], text=True).splitlines())
+          if changed != expected:
+              raise SystemExit('Protocol branch changes files outside the two reviewed workflows.')
+          record = {key: os.environ[key] for key in (
+              'SOURCE_COMMIT', 'SOURCE_BASE', 'PROTOCOL_COMMIT', 'SOURCE_FILE',
+              'SOURCE_SHA256', 'PHASE', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT',
+              'RUNNER_OS', 'RUNNER_ARCH', 'LEAN_NUM_THREADS', 'CXX')}
+          record['protocolOnlyPaths'] = sorted(changed)
+          Path(os.environ['EVIDENCE_DIR'], 'identity.json').write_text(
+              json.dumps(record, indent=2) + '\n')
+          print(json.dumps(record, indent=2))
+          PY
+          cat > "$RUNNER_TEMP/delta-star-cache-preflight.py" <<'PY'
+          import json, os, urllib.request
+          repo = os.environ['GITHUB_REPOSITORY']
+          if repo != 'solidity-master/proximityprize':
+              raise SystemExit('Unexpected cache repository.')
+          prefix = 'delta-star-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['SOURCE_COMMIT'] + '-'
+          allowed = {prefix + 'prebuild', prefix + 'validate'}
+          def read(path):
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/' + repo + path,
+                  headers={'Accept': 'application/vnd.github+json',
+                           'User-Agent': 'delta-star-validation-preflight'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          # Public metadata only; no token or other credential is read or supplied.
+          workflows = read('/actions/workflows?per_page=100')
+          if workflows['total_count'] != len(workflows['workflows']):
+              raise SystemExit('Workflow inventory is incomplete; stop.')
+          allowed_workflows = {
+              '.github/workflows/check-imports.yml',
+              '.github/workflows/folded-source-fiber-validation-phase.yml',
+          }
+          if any(w['state'] == 'active' and w['path'] not in allowed_workflows
+                 for w in workflows['workflows']):
+              raise SystemExit('An inherited workflow is enabled; stop before cache writes.')
+          listing = read('/actions/caches?per_page=100')
+          usage = read('/actions/cache/usage')
+          entries = listing['actions_caches']
+          if listing['total_count'] != len(entries) or len(entries) > 2:
+              raise SystemExit('Cache preflight cannot establish an exclusive two-entry budget.')
+          if any(entry['key'] not in allowed for entry in entries):
+              raise SystemExit('An unrelated fork cache exists; stop without deleting it.')
+          if usage['active_caches_count'] > 2:
+              raise SystemExit('Cache usage reports additional entries; stop without deleting them.')
+          existing = max(sum(entry['size_in_bytes'] for entry in entries),
+                         usage['active_caches_size_in_bytes'])
+          pending = int(os.environ.get('PENDING_CACHE_BYTES', '0'))
+          this_key = prefix + os.environ['PHASE']
+          already_present = any(entry['key'] == this_key for entry in entries)
+          # Payload caps: 3.5 GiB prebuild + 5.25 GiB validated = 8.75 GiB.
+          projected = existing + (pending + 8 * 1024**2 if pending and not already_present else 0)
+          caps = {'prebuild': 7 * 1024**3 // 2, 'validate': 21 * 1024**3 // 4}
+          if pending > caps.get(os.environ['PHASE'], 0) or projected >= 9 * 1024**3:
+              raise SystemExit('Fixed cache storage ceiling would be exceeded; no cache upload.')
+          print(json.dumps({'repository': repo, 'existingCacheBytes': existing,
+                            'projectedCacheBytes': projected,
+                            'allowedCacheEntries': 2, 'ceilingGiBExclusive': 9}))
+          PY
+          python3 "$RUNNER_TEMP/delta-star-cache-preflight.py"
+
+      - name: Release unused SDK space on this disposable hosted runner
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          # Only these preinstalled SDKs; no project or local-machine paths.
+          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h . "$RUNNER_TEMP" | tee "$EVIDENCE_DIR/initial-disk.txt"
+          available_kib=$(df -Pk . | awk 'NR == 2 { print $4 }')
+          if (( available_kib < 28 * 1024 * 1024 )); then
+            echo 'Less than 28 GiB free after hosted-runner SDK cleanup; preparation fails.' >&2
+            exit 1
+          fi
+
+      - name: Install checksummed release binaries and the pinned Lean toolchain
+        run: |
+          set -euo pipefail
+          tool_dir=$(mktemp -d "$RUNNER_TEMP/delta-star-tools.XXXXXX")
+          curl --fail --location --retry 3 --output "$tool_dir/elan.tar.gz" \
+            https://github.com/leanprover/elan/releases/download/v4.2.4/elan-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63 \
+            "$tool_dir/elan.tar.gz" | sha256sum --check
+          tar -xzf "$tool_dir/elan.tar.gz" -C "$tool_dir"
+          "$tool_dir/elan-init" -y --no-modify-path --default-toolchain none
+          export PATH="$ELAN_HOME/bin:$PATH"
+          echo "$ELAN_HOME/bin" >> "$GITHUB_PATH"
+          elan toolchain install "$(cat lean-toolchain)"
+          curl --fail --location --retry 3 --output "$tool_dir/uv.tar.gz" \
+            https://github.com/astral-sh/uv/releases/download/0.13.6/uv-x86_64-unknown-linux-musl.tar.gz
+          printf '%s  %s\n' \
+            5d61f26b6c7213779eda90edc6971ea6b0b796bfb8d49a574c8ad69b59838548 \
+            "$tool_dir/uv.tar.gz" | sha256sum --check
+          tar -xzf "$tool_dir/uv.tar.gz" -C "$tool_dir"
+          export PATH="$tool_dir/uv-x86_64-unknown-linux-musl:$PATH"
+          echo "$tool_dir/uv-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+          command -v zstd
+          { elan --version; lean --version; lake --version; uv --version; g++ --version; } \
+            | tee "$EVIDENCE_DIR/tool-versions.txt"
+
+      - name: Restore only the preceding phase from this workflow run
+        if: inputs.phase != 'prebuild'
+        id: previous-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/delta-star-prebuild
+          key: delta-star-${{ github.run_id }}-fe58c7877f135aafd0abb76c89a0d5865a01d798-${{ inputs.phase == 'validate' && 'prebuild' || 'validate' }}
+          fail-on-cache-miss: true
+          enableCrossOsArchive: false
+
+      - name: Verify and restore the preceding phase
+        if: inputs.phase != 'prebuild'
+        env:
+          EXACT_CACHE_HIT: ${{ steps.previous-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          test "$EXACT_CACHE_HIT" = true
+          case "$PHASE" in
+            validate) prior_phase=prebuild ;;
+            axioms) prior_phase=validate ;;
+            *) exit 1 ;;
+          esac
+          {
+            printf '%s\n' "$prior_phase" "$GITHUB_RUN_ID" "$PROTOCOL_COMMIT" "$RUNNER_OS" "$RUNNER_ARCH"
+            git rev-parse HEAD
+            sha256sum lean-toolchain lakefile.toml lake-manifest.json
+          } | cmp - "$BUNDLE_DIR/source.txt"
+          (cd "$BUNDLE_DIR" && sha256sum --check archive.sha256)
+          zstd -dc "$BUNDLE_DIR/lake.tar.zst" | tar -xf -
+          # This is the restored transfer archive on the disposable runner.
+          rm -- "$BUNDLE_DIR/lake.tar.zst"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          if [ "$PHASE" = axioms ]; then
+            test "$(cat "$BUNDLE_DIR/validate.passed")" = './scripts/validate.sh: exit 0'
+            cp "$BUNDLE_DIR/validate.passed" "$EVIDENCE_DIR/validate.passed"
+            cp "$BUNDLE_DIR/headline-axioms.json" "$EVIDENCE_DIR/headline-axioms.json"
+          fi
+
+      - name: Fetch pinned dependency build archives
+        if: inputs.phase == 'prebuild'
+        run: |
+          set -euo pipefail
+          ./scripts/lake-locked.sh exe cache get 2>&1 | tee "$EVIDENCE_DIR/dependency-cache.log"
+
+      - name: Build canonical and extension libraries serially with the locked wrapper
+        if: inputs.phase == 'prebuild'
+        run: |
+          set -euo pipefail
+          timeout --signal=INT --kill-after=2m 280m bash -euo pipefail 2>&1 <<'BUILD' | tee "$EVIDENCE_DIR/prebuild.log"
+          ./scripts/lake-locked.sh build ArkLib
+          ./scripts/lake-locked.sh build ArkLibExtensions ProximityPrizeExtensions
+          BUILD
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Run the exact required default validator
+        if: inputs.phase == 'validate'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          ./scripts/validate.sh 2>&1 | tee "$EVIDENCE_DIR/validate.log"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          printf '%s\n' './scripts/validate.sh: exit 0' > "$EVIDENCE_DIR/validate.passed"
+
+      - name: Warm the prize substrate and run the narrow proof check
+        if: inputs.phase == 'validate'
+        run: |
+          set -euo pipefail
+          ./scripts/pg-warm.sh 2>&1 | tee "$EVIDENCE_DIR/pg-warm.log"
+          ./scripts/pg-iterate.sh "$SOURCE_FILE" 2>&1 | tee "$EVIDENCE_DIR/pg-iterate.log"
+          lake env lean -DautoImplicit=false -Dpp.fullNames=true "$SOURCE_FILE" \
+            2>&1 | tee "$EVIDENCE_DIR/raw-axioms.log"
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          prefix = 'ArkLib.ProximityGap.Frontier.FoldedSourceFiber.'
+          expected = {prefix + name for name in (
+              'globallyDisjoint_of_support_card', 'NR_eq_factorial_of_unit_letters',
+              'card_sourceFiber_of_fourteen_unit_letters',
+              'card_primitiveSourceFiber_of_fourteen_unit_letters',
+              'card_primitiveUnitSourcePairs')}
+          text = Path(os.environ['EVIDENCE_DIR'], 'raw-axioms.log').read_text()
+          reports = re.findall(r"'([^']+)' depends on axioms:\s*\[([^\]]*)\]", text, re.S)
+          if len(reports) != 5 or {name for name, _ in reports} != expected:
+              raise SystemExit('Missing, duplicate, or unexpected headline theorem axiom report.')
+          allowed = {'propext', 'Classical.choice', 'Quot.sound'}
+          audited = {name: sorted(a.strip() for a in values.split(',') if a.strip())
+                     for name, values in reports}
+          if any(set(values) - allowed for values in audited.values()):
+              raise SystemExit('Unexpected axiom in a headline theorem.')
+          if re.search(r'\b(?:warning|error):', text):
+              raise SystemExit('Raw Lean emitted a warning or error.')
+          Path(os.environ['EVIDENCE_DIR'], 'headline-axioms.json').write_text(
+              json.dumps(audited, indent=2) + '\n')
+          PY
+
+      - name: Archive a successful prebuild for the next serial job
+        if: inputs.phase != 'axioms'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          if [ "$PHASE" = validate ]; then
+            cp "$EVIDENCE_DIR/validate.passed" "$BUNDLE_DIR/validate.passed"
+            cp "$EVIDENCE_DIR/headline-axioms.json" "$BUNDLE_DIR/headline-axioms.json"
+          fi
+          {
+            printf '%s\n' "$PHASE" "$GITHUB_RUN_ID" "$PROTOCOL_COMMIT" "$RUNNER_OS" "$RUNNER_ARCH"
+            git rev-parse HEAD
+            sha256sum lean-toolchain lakefile.toml lake-manifest.json
+          } > "$BUNDLE_DIR/source.txt"
+          tar --exclude='*.setup.json' -cf - .lake/packages .lake/build \
+            | zstd -T1 -o "$BUNDLE_DIR/lake.tar.zst"
+          archive_bytes=$(stat -c %s "$BUNDLE_DIR/lake.tar.zst")
+          case "$PHASE" in
+            prebuild) archive_cap=$((7 * 1024 * 1024 * 1024 / 2)) ;;
+            validate) archive_cap=$((21 * 1024 * 1024 * 1024 / 4)) ;;
+            *) exit 1 ;;
+          esac
+          if (( archive_bytes > archive_cap )); then
+            echo 'Archive exceeds its fixed phase cache payload cap; no upload.' >&2
+            exit 1
+          fi
+          (cd "$BUNDLE_DIR" && sha256sum lake.tar.zst > archive.sha256)
+          PENDING_CACHE_BYTES="$archive_bytes" python3 "$RUNNER_TEMP/delta-star-cache-preflight.py"
+
+      - name: Cache this prebuild under an exact run-specific key
+        if: inputs.phase != 'axioms'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/delta-star-prebuild
+          key: delta-star-${{ github.run_id }}-fe58c7877f135aafd0abb76c89a0d5865a01d798-${{ inputs.phase }}
+          enableCrossOsArchive: false
+
+      - name: Require the just-saved cache to exist
+        if: inputs.phase != 'axioms'
+        id: saved-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/delta-star-prebuild
+          key: delta-star-${{ github.run_id }}-fe58c7877f135aafd0abb76c89a0d5865a01d798-${{ inputs.phase }}
+          lookup-only: true
+          fail-on-cache-miss: true
+          enableCrossOsArchive: false
+
+      - name: Reject a skipped or inexact cache save
+        if: inputs.phase != 'axioms'
+        env:
+          EXACT_CACHE_HIT: ${{ steps.saved-cache.outputs.cache-hit }}
+        run: test "$EXACT_CACHE_HIT" = true
+
+      - name: Run the exact required validator with the axiom gate
+        if: inputs.phase == 'axioms'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          ./scripts/validate.sh --axioms 2>&1 | tee "$EVIDENCE_DIR/validate-axioms.log"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          printf '%s\n' './scripts/validate.sh --axioms: exit 0' > "$EVIDENCE_DIR/validate-axioms.passed"
+          {
+            printf 'Verified proof commit: `%s`\n\n' "$SOURCE_COMMIT"
+            printf 'Workflow protocol commit: `%s`\n\n' "$PROTOCOL_COMMIT"
+            printf 'Both exact required validation commands passed across the serial jobs.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record final evidence status in the job log
+        if: always()
+        run: |
+          set -euo pipefail
+          # Command output is already retained in GitHub's workflow logs via tee.
+          # Do not upload Actions artifacts or any local-machine evidence.
+          if [ -f "$EVIDENCE_DIR/identity.json" ]; then cat "$EVIDENCE_DIR/identity.json"; fi
+          if [ -f "$EVIDENCE_DIR/headline-axioms.json" ]; then cat "$EVIDENCE_DIR/headline-axioms.json"; fi
+          for result in validate validate-axioms; do
+            if [ -f "$EVIDENCE_DIR/$result.passed" ]; then
+              cat "$EVIDENCE_DIR/$result.passed"
+            else
+              printf '%s\n' "$result: no successful completion marker in this job"
+            fi
+          done

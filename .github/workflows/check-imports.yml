@@ -1,26 +1,33 @@
-name: Check Imports
+# Validation protocol for fe58c787; keep these workflow changes out of the proof PR.
+# Only the validation branch replaces this existing nonscheduled workflow entry.
+name: Validate fixed FoldedSourceFiber contribution
 
-on:
-  # Every pull request is checked, including stacked ones whose base is another PR branch.
-  pull_request:
-  merge_group:
-    types: [checks_requested]
-  workflow_dispatch:
+'on':
+  push:
+    branches: [validation/folded-source-fiber-fe58c787]
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: folded-source-fiber-fe58c787
+  cancel-in-progress: false
 
 jobs:
-  check-imports:
-    name: Check Library File Imports
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          # Canonical provenance checks read the pinned upstream Git blobs.
-          fetch-depth: 0
+  prebuild:
+    if: github.repository == 'solidity-master/proximityprize'
+    uses: ./.github/workflows/folded-source-fiber-validation-phase.yml
+    with:
+      phase: prebuild
 
-      - name: Check that all files are imported
-        run: ./scripts/check-imports.sh
+  validate:
+    needs: prebuild
+    uses: ./.github/workflows/folded-source-fiber-validation-phase.yml
+    with:
+      phase: validate
+
+  axioms:
+    needs: validate
+    uses: ./.github/workflows/folded-source-fiber-validation-phase.yml
+    with:
+      phase: axioms
