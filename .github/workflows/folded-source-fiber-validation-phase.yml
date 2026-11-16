@@ -28,9 +28,6 @@ jobs:
       SOURCE_SHA256: f94da8f0f3f06885752c103ebd379b016c3b0108450ead74e4b07790573296cb
       LEAN_NUM_THREADS: '1'
       CXX: g++
-      ELAN_HOME: ${{ runner.temp }}/delta-star-elan
-      EVIDENCE_DIR: ${{ runner.temp }}/delta-star-evidence
-      BUNDLE_DIR: ${{ runner.temp }}/delta-star-prebuild
 
     steps:
       - name: Check out the fixed contribution
@@ -41,6 +38,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           submodules: false
+
+      - name: Initialize runner-local paths
+        run: |
+          printf '%s\n' \
+            "ELAN_HOME=$RUNNER_TEMP/delta-star-elan" \
+            "EVIDENCE_DIR=$RUNNER_TEMP/delta-star-evidence" \
+            "BUNDLE_DIR=$RUNNER_TEMP/delta-star-prebuild" >> "$GITHUB_ENV"
 
       - name: Verify proof and protocol identities
         run: |
