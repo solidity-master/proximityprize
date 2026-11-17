@@ -8,20 +8,256 @@ name: Validate fixed FoldedSourceFiber contribution
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: folded-source-fiber-fe58c787
   cancel-in-progress: false
 
 jobs:
+  canonical:
+    if: github.repository == 'solidity-master/proximityprize'
+    uses: ./.github/workflows/folded-source-fiber-validation-phase.yml
+    with:
+      phase: canonical
+
   prebuild:
+    needs: canonical
     if: github.repository == 'solidity-master/proximityprize'
     uses: ./.github/workflows/folded-source-fiber-validation-phase.yml
     with:
       phase: prebuild
 
-  validate:
+  retire-canonical:
     needs: prebuild
+    if: github.repository == 'solidity-master/proximityprize' && needs.prebuild.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # This maintenance job has no checkout and never executes contribution code.
+    permissions:
+      actions: write
+    steps:
+      - name: Retire only the superseded canonical cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROTOCOL_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          """Retire only this run's superseded canonical cache after a verified replacement."""
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+
+          REPO = 'solidity-master/proximityprize'
+          BRANCH = 'validation/folded-source-fiber-fe58c787'
+          WORKFLOW = '.github/workflows/check-imports.yml'
+          SOURCE = 'fe58c7877f135aafd0abb76c89a0d5865a01d798'
+          CAP = 7 * 1024**3 // 2
+          OVERHEAD = 8 * 1024**2
+          CEILING = 9 * 1024**3
+          POLL_ATTEMPTS = 37
+          POLL_SECONDS = 10
+          API_BUDGET_SECONDS = 840
+
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+
+          def integer(value):
+              return type(value) is int and value >= 0
+
+
+          def cache_identity(entry):
+              return tuple(entry[k] for k in ('id', 'key', 'version', 'ref', 'size_in_bytes'))
+
+
+          def context(env):
+              require(env.get('GITHUB_REPOSITORY') == REPO, 'Unexpected repository.')
+              require(env.get('GITHUB_REF') == 'refs/heads/' + BRANCH, 'Unexpected branch ref.')
+              require(env.get('GITHUB_EVENT_NAME') == 'push', 'Unexpected trigger event.')
+              run = env.get('GITHUB_RUN_ID', '')
+              attempt = env.get('GITHUB_RUN_ATTEMPT', '')
+              sha = env.get('PROTOCOL_COMMIT', '')
+              require(re.fullmatch(r'[1-9][0-9]*', run) is not None, 'Invalid run ID.')
+              require(re.fullmatch(r'[1-9][0-9]*', attempt) is not None, 'Invalid run attempt.')
+              require(re.fullmatch(r'[0-9a-f]{40}', sha) is not None, 'Invalid protocol SHA.')
+              require(env.get('GITHUB_SHA') == sha, 'Protocol SHA differs from workflow head.')
+              return int(run), int(attempt), sha
+
+
+          def verify_producer(api, run, attempt, sha):
+              record = api('GET', f'/actions/runs/{run}')
+              require(integer(record.get('id')) and integer(record.get('run_attempt'))
+                      and record['id'] == run and record['run_attempt'] == attempt,
+                      'Run identity or attempt differs.')
+              require(record.get('repository', {}).get('full_name') == REPO
+                      and record.get('head_repository', {}).get('full_name') == REPO,
+                      'Run repository identity differs.')
+              require(record.get('head_sha') == sha and record.get('head_branch') == BRANCH
+                      and record.get('path') == WORKFLOW and record.get('event') == 'push',
+                      'Run head, branch, workflow, or event differs.')
+              require(record.get('status') == 'in_progress' and record.get('conclusion') is None,
+                      'Expected this currently running workflow.')
+              jobs = api('GET', f'/actions/runs/{run}/jobs?filter=all&per_page=100')
+              items = jobs.get('jobs')
+              require(isinstance(items, list) and integer(jobs.get('total_count'))
+                      and jobs['total_count'] == len(items) and len(items) <= 100,
+                      'Incomplete job inventory; no cache deletion.')
+              for job in items:
+                  require(job.get('run_id') == run and job.get('head_sha') == sha
+                          and integer(job.get('run_attempt')) and 1 <= job['run_attempt'] <= attempt,
+                          'A job has an unexpected run, head, or attempt.')
+              producers = [j for j in items if j.get('name') == 'prebuild / run']
+              require(bool(producers), 'No extensions prebuild job exists.')
+              latest_attempt = max(j['run_attempt'] for j in producers)
+              latest = [j for j in producers if j['run_attempt'] == latest_attempt]
+              require(len(latest) == 1, 'Ambiguous latest extensions prebuild job.')
+              producer = latest[0]
+              require(producer.get('status') == 'completed' and producer.get('conclusion') == 'success',
+                      'Latest extensions prebuild did not succeed; no fallback to an older attempt.')
+              checks = [s for s in producer.get('steps', [])
+                        if s.get('name') == 'Reject a skipped or inexact cache save']
+              require(len(checks) == 1 and checks[0].get('status') == 'completed'
+                      and checks[0].get('conclusion') == 'success',
+                      'Replacement cache save was not verified by its producer.')
+              # A failed retirement may be retried without rerunning an earlier successful producer.
+              return latest_attempt
+
+
+          def inventory(api, run):
+              listing = api('GET', '/actions/caches?per_page=100')
+              usage = api('GET', '/actions/cache/usage')
+              entries = listing.get('actions_caches')
+              require(isinstance(entries, list) and integer(listing.get('total_count'))
+                      and listing['total_count'] == len(entries) and len(entries) <= 2,
+                      'Incomplete or excessive cache inventory; no general cleanup.')
+              prefix = f'delta-star-{run}-{SOURCE}-'
+              allowed = {prefix + 'canonical', prefix + 'prebuild'}
+              keys, ids, versions = set(), set(), set()
+              for entry in entries:
+                  require(integer(entry.get('id')) and entry['id'] > 0, 'Invalid cache ID.')
+                  require(entry.get('key') in allowed and entry.get('ref') == 'refs/heads/' + BRANCH,
+                          'Unrelated cache key or ref; no deletion.')
+                  require(entry['key'] not in keys and entry['id'] not in ids,
+                          'Duplicate cache keys or IDs; no deletion.')
+                  require(integer(entry.get('size_in_bytes')) and 0 < entry['size_in_bytes'] <= CAP + OVERHEAD,
+                          'Cache size is missing or exceeds its fixed phase cap.')
+                  version = entry.get('version', '')
+                  require(isinstance(version, str) and re.fullmatch(r'[0-9a-f]{64}', version) is not None,
+                          'Invalid cache version.')
+                  keys.add(entry['key'])
+                  ids.add(entry['id'])
+                  versions.add(version)
+              require(len(versions) <= 1, 'Canonical and replacement cache versions differ.')
+              require(prefix + 'prebuild' in keys, 'A valid replacement cache is required.')
+              require(integer(usage.get('active_caches_count'))
+                      and integer(usage.get('active_caches_size_in_bytes')),
+                      'Cache usage metadata is missing or invalid.')
+              require(usage['active_caches_count'] <= 2, 'Usage reports additional caches.')
+              total = sum(e['size_in_bytes'] for e in entries)
+              require(max(total, usage['active_caches_size_in_bytes']) < CEILING,
+                      'Cache usage reaches the fixed ceiling.')
+              settled = (usage['active_caches_count'] == len(entries)
+                         and usage['active_caches_size_in_bytes'] == total)
+              by_key = {e['key']: e for e in entries}
+              return by_key.get(prefix + 'canonical'), by_key[prefix + 'prebuild'], settled
+
+
+          def retire(api, env, pause=time.sleep):
+              run, attempt, sha = context(env)
+              producer_attempt = verify_producer(api, run, attempt, sha)
+              workflows = api('GET', '/actions/workflows?per_page=100')
+              items = workflows.get('workflows')
+              require(isinstance(items, list) and integer(workflows.get('total_count'))
+                      and workflows['total_count'] == len(items),
+                      'Incomplete workflow inventory.')
+              allowed = {WORKFLOW, '.github/workflows/folded-source-fiber-validation-phase.yml'}
+              states = {'active', 'disabled_fork', 'disabled_manually', 'disabled_inactivity', 'deleted'}
+              require(all(isinstance(w.get('path'), str) and w.get('state') in states for w in items),
+                      'Uncertain workflow state.')
+              require(all(w.get('state') != 'active' or w.get('path') in allowed for w in items),
+                      'An unrelated workflow is active.')
+              canonical, replacement, settled = inventory(api, run)
+              replacement_identity = cache_identity(replacement)
+              canonical_identity = cache_identity(canonical) if canonical is not None else None
+              for poll in range(POLL_ATTEMPTS):
+                  require(replacement_identity == cache_identity(replacement)
+                          and canonical_identity == (cache_identity(canonical) if canonical is not None else None),
+                          'Cache identities changed while waiting for initial usage metadata.')
+                  if settled:
+                      break
+                  if poll + 1 == POLL_ATTEMPTS:
+                      raise SystemExit('Initial cache usage did not settle; retry only this maintenance job later.')
+                  pause(POLL_SECONDS)
+                  canonical, replacement, settled = inventory(api, run)
+              deleted_id = None
+              if canonical is not None:
+                  # Recheck immediately before the only mutation; never delete by prefix or all-cache flag.
+                  again, replacement, settled = inventory(api, run)
+                  require(settled and again is not None and cache_identity(again) == cache_identity(canonical)
+                          and replacement_identity == cache_identity(replacement),
+                          'Cache identities changed before retirement.')
+                  api('DELETE', f"/actions/caches/{canonical['id']}")
+                  deleted_id = canonical['id']
+              for poll in range(POLL_ATTEMPTS):
+                  canonical, replacement, settled = inventory(api, run)
+                  require(replacement_identity == cache_identity(replacement),
+                          'Replacement cache changed during retirement.')
+                  require(canonical is None or canonical['id'] == deleted_id,
+                          'A different canonical cache appeared during retirement.')
+                  if canonical is None and settled:
+                      result = {'runId': run, 'protocolCommit': sha, 'producerAttempt': producer_attempt,
+                                'deletedCanonicalCacheId': deleted_id,
+                                'retainedPrebuildCacheId': replacement['id'], 'liveCacheCount': 1,
+                                'retainedBytes': replacement['size_in_bytes'], 'ceilingGiBExclusive': 9}
+                      print(json.dumps(result, sort_keys=True))
+                      return result
+                  if poll + 1 < POLL_ATTEMPTS:
+                      pause(POLL_SECONDS)
+              raise SystemExit('Retirement not confirmed after bounded checks; retry only maintenance after metadata settles.')
+
+
+          def make_gh_api(deadline):
+              def api(method, path):
+                  require(method in ('GET', 'DELETE') and path.startswith('/actions/')
+                          and (method != 'DELETE' or re.fullmatch(r'/actions/caches/[1-9][0-9]*', path)),
+                          'Unexpected API operation.')
+                  remaining = deadline - time.monotonic()
+                  require(remaining > 0, 'Cache maintenance exceeded its 14-minute API budget.')
+                  # gh receives its built-in token through normal inherited authentication.
+                  # Never read, print, serialize, or forward the token value or auth headers.
+                  try:
+                      result = subprocess.run(
+                          ['gh', 'api', '--hostname', 'github.com', '--method', method,
+                           'repos/' + REPO + path], capture_output=True, text=True,
+                          timeout=min(20, remaining), check=False)
+                  except subprocess.TimeoutExpired:
+                      raise SystemExit('A cache-maintenance API request timed out; stop.')
+                  require(result.returncode == 0, f'GitHub API {method} failed; stop without further mutation.')
+                  if method == 'DELETE':
+                      require(not result.stdout.strip(), 'Unexpected deletion response; verify before retrying.')
+                      return None
+                  try:
+                      metadata = json.loads(result.stdout)
+                  except ValueError:
+                      raise SystemExit('GitHub returned invalid metadata; stop.')
+                  require(isinstance(metadata, dict), 'GitHub returned malformed metadata; stop.')
+                  return metadata
+              return api
+
+
+          if __name__ == '__main__':
+              retire(make_gh_api(time.monotonic() + API_BUDGET_SECONDS), os.environ)
+          PY
+
+  validate:
+    needs: retire-canonical
     uses: ./.github/workflows/folded-source-fiber-validation-phase.yml
     with:
       phase: validate
